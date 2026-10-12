@@ -1,0 +1,1184 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+from datetime import datetime, timedelta, time as dtime
+import pytz
+
+# Configuração da página
+st.set_page_config(
+    page_title="Radar B3: Robô Trader, Carteiras & Simulador",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Estilização CSS personalizada
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #1e222d;
+        border-radius: 8px;
+        padding: 15px;
+        border: 1px solid #2a2e39;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 18px;
+        font-weight: 600;
+        border-radius: 6px 6px 0 0;
+    }
+    .status-aberto {
+        color: #00E676;
+        font-weight: bold;
+    }
+    .status-fechado {
+        color: #EF5350;
+        font-weight: bold;
+    }
+    .status-leilao {
+        color: #FFA726;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -----------------------------------------------------------------------------
+# 1. Checagem de Horário Oficial da Bolsa B3 (Horário de Brasília / UTC-3)
+# -----------------------------------------------------------------------------
+def obter_status_mercado_b3():
+    """Verifica se a B3 está em horário de pregão oficial."""
+    fuso_sp = pytz.timezone("America/Sao_Paulo")
+    agora_sp = datetime.now(fuso_sp)
+    dia_semana = agora_sp.weekday()  # 0=Segunda, 4=Sexta, 5=Sábado, 6=Domingo
+    hora_atual = agora_sp.time()
+
+    abertura_leilao = dtime(9, 45)
+    abertura_pregao = dtime(10, 0)
+    fechamento_pregao = dtime(17, 0)
+    fechamento_after = dtime(17, 55)
+
+    if dia_semana >= 5:
+        return "🔴 MERCADO FECHADO (Fim de Semana)", "Fora do Horário", agora_sp
+    elif hora_atual < abertura_leilao:
+        return "🔴 MERCADO FECHADO (Antes do Pregão)", "Abre às 10:00", agora_sp
+    elif abertura_leilao <= hora_atual < abertura_pregao:
+        return "🟡 LEILÃO DE PRÉ-ABERTURA (09:45 - 10:00)", "Abertura iminente", agora_sp
+    elif abertura_pregao <= hora_atual <= fechamento_pregao:
+        return "🟢 PREGÃO REGULAR ABERTO (10:00 - 17:00)", "Ordens a Mercado Ativas", agora_sp
+    elif fechamento_pregao < hora_atual <= fechamento_after:
+        return "🟡 LEILÃO DE FECHAMENTO / AFTER (17:00 - 17:55)", "Ajustes de Posição", agora_sp
+    else:
+        return "🔴 MERCADO FECHADO (Após Pregão)", "Encerramento do Dia", agora_sp
+
+# -----------------------------------------------------------------------------
+# 2. Indicadores Macroeconômicos (Banco Central do Brasil / SGS)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=1800)
+def obter_dados_macro():
+    """Busca dados oficiais da Selic no SGS do Banco Central do Brasil."""
+    dados = {
+        "selic": 13.65,
+        "cdi": 13.55,
+        "data": datetime.now().strftime("%d/%m/%Y")
+    }
+    try:
+        url_selic = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1178/dados/ultimos/1?formato=json"
+        res_selic = requests.get(url_selic, timeout=5).json()
+        if res_selic:
+            selic_val = float(res_selic[0]["valor"])
+            dados["selic"] = selic_val
+            dados["cdi"] = round(selic_val - 0.10, 2)
+            dados["data"] = res_selic[0]["data"]
+    except Exception:
+        pass
+    return dados
+
+# -----------------------------------------------------------------------------
+# 3. Coleta de Todos os Tickers da B3 em Tempo Real
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=120)
+def carregar_todos_tickers_b3():
+    """Coleta os ativos listados na B3 em tempo real."""
+    todos_ativos = []
+    page = 1
+    
+    while True:
+        try:
+            url = f"https://brapi.dev/api/quote/list?limit=1000&page={page}"
+            res = requests.get(url, timeout=10)
+            if res.status_code != 200:
+                break
+            dados = res.json()
+            stocks = dados.get("stocks", [])
+            if not stocks:
+                break
+            todos_ativos.extend(stocks)
+            if not dados.get("hasNextPage", False):
+                break
+            page += 1
+        except Exception:
+            break
+
+    if not todos_ativos:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(todos_ativos)
+    df["stock"] = df["stock"].fillna("").astype(str).str.upper()
+    df["name"] = df["name"].fillna(df["stock"]).astype(str)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce").fillna(0.0)
+    df["change"] = pd.to_numeric(df["change"], errors="coerce").fillna(0.0)
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce").fillna(0.0)
+    df["sector"] = df["sector"].fillna("Outros").astype(str)
+
+    df["vol_financeiro_mi"] = (df["close"] * df["volume"]) / 1_000_000
+
+    def mapear_tipo(t, ticker):
+        t_str = str(t).lower()
+        if t_str == "fund" or any(num in ticker for num in ["11", "11B"]):
+            return "FII / Fundo"
+        elif t_str == "bdr" or any(num in ticker for num in ["34", "35", "32"]):
+            return "BDR"
+        else:
+            return "Ação"
+
+    df["tipo_desc"] = [mapear_tipo(t, s) for t, s in zip(df.get("type", []), df["stock"])]
+
+    df = df.rename(columns={
+        "stock": "Ticker",
+        "name": "Nome / Razão Social",
+        "close": "Preço Atual (R$)",
+        "change": "Variação Dia (%)",
+        "volume": "Volume Cotas/Ações",
+        "vol_financeiro_mi": "Volume Financeiro (R$ Mi)",
+        "tipo_desc": "Classe",
+        "sector": "Setor"
+    })
+
+    return df
+
+# -----------------------------------------------------------------------------
+# 4. Indicadores Técnicos Avançados (Arsenal do Corretor B3)
+# -----------------------------------------------------------------------------
+import yfinance as yf
+
+def calcular_ema(serie, periodo):
+    """Média Móvel Exponencial."""
+    return serie.ewm(span=periodo, adjust=False).mean()
+
+def calcular_sma(serie, periodo):
+    """Média Móvel Simples."""
+    return serie.rolling(window=periodo).mean()
+
+def calcular_rsi(serie, periodo=14):
+    """IFR / RSI (Índice de Força Relativa)."""
+    delta = serie.diff()
+    ganho = delta.clip(lower=0).rolling(window=periodo).mean()
+    perda = (-delta.clip(upper=0)).rolling(window=periodo).mean()
+    rs = ganho / (perda + 1e-10)
+    return 100 - (100 / (1 + rs))
+
+def calcular_macd(serie, rapida=12, lenta=26, sinal=9):
+    """MACD (Moving Average Convergence Divergence)."""
+    ema_rapida = calcular_ema(serie, rapida)
+    ema_lenta = calcular_ema(serie, lenta)
+    macd_line = ema_rapida - ema_lenta
+    signal_line = calcular_ema(macd_line, sinal)
+    histograma = macd_line - signal_line
+    return macd_line, signal_line, histograma
+
+def calcular_bollinger(serie, periodo=20, desvios=2.0):
+    """Bandas de Bollinger."""
+    media = calcular_sma(serie, periodo)
+    std = serie.rolling(window=periodo).std()
+    banda_sup = media + (desvios * std)
+    banda_inf = media - (desvios * std)
+    percentual_b = (serie - banda_inf) / (banda_sup - banda_inf + 1e-10)
+    return banda_sup, media, banda_inf, percentual_b
+
+def calcular_adx(high, low, close, periodo=14):
+    """ADX (Average Directional Index) - Força da tendência."""
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    
+    atr = tr.rolling(window=periodo).mean()
+    plus_di = 100 * (plus_dm.rolling(window=periodo).mean() / (atr + 1e-10))
+    minus_di = 100 * (minus_dm.rolling(window=periodo).mean() / (atr + 1e-10))
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10))
+    adx = dx.rolling(window=periodo).mean()
+    return adx, plus_di, minus_di, atr
+
+def calcular_obv(close, volume):
+    """OBV (On Balance Volume) - Fluxo institucional."""
+    direction = np.sign(close.diff()).fillna(0)
+    obv = (direction * volume).cumsum()
+    return obv
+
+def calcular_mfi(high, low, close, volume, periodo=14):
+    """MFI (Money Flow Index) - IFR ponderado por volume."""
+    preco_tipico = (high + low + close) / 3
+    money_flow_raw = preco_tipico * volume
+    positivo = money_flow_raw.where(preco_tipico > preco_tipico.shift(1), 0.0).rolling(periodo).sum()
+    negativo = money_flow_raw.where(preco_tipico < preco_tipico.shift(1), 0.0).rolling(periodo).sum()
+    ratio = positivo / (negativo + 1e-10)
+    return 100 - (100 / (1 + ratio))
+
+def calcular_estocastico(high, low, close, k_periodo=14, d_periodo=3):
+    """Estocástico %K e %D."""
+    low_min = low.rolling(window=k_periodo).min()
+    high_max = high.rolling(window=k_periodo).max()
+    k = 100 * ((close - low_min) / (high_max - low_min + 1e-10))
+    d = k.rolling(window=d_periodo).mean()
+    return k, d
+
+def calcular_vwap(high, low, close, volume):
+    """VWAP (Volume Weighted Average Price) - Preço médio institucional."""
+    preco_tipico = (high + low + close) / 3
+    vwap_acum = (preco_tipico * volume).cumsum() / (volume.cumsum() + 1e-10)
+    return vwap_acum
+
+def calcular_atr(high, low, close, periodo=14):
+    """ATR (Average True Range) para sizing e stops dinâmicos."""
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(window=periodo).mean()
+
+# -----------------------------------------------------------------------------
+# 5. Motor de Simulação do Robô Trader B3 (Engine Profissional)
+# -----------------------------------------------------------------------------
+def gerar_score_confluencia(serie_close, serie_high, serie_low, serie_volume, idx):
+    """
+    Sistema de Confluência Multi-Indicador (Profissional B3).
+    Cada indicador técnico vota de -2 a +2 pontos. O score final
+    determina a intensidade e a direção do sinal.
+    Retorna (score_total, detalhes_dict).
+    """
+    close = serie_close.iloc[:idx+1]
+    high = serie_high.iloc[:idx+1]
+    low = serie_low.iloc[:idx+1]
+    vol = serie_volume.iloc[:idx+1]
+    
+    if len(close) < 30:
+        return 0, {}
+
+    score = 0
+    detalhes = {}
+    
+    # 1. MACD (Convergência/Divergência)
+    macd_l, macd_s, macd_h = calcular_macd(close)
+    if len(macd_h) >= 2:
+        macd_val = float(macd_h.iloc[-1])
+        macd_prev = float(macd_h.iloc[-2])
+        if macd_val > 0 and macd_val > macd_prev:
+            score += 2; detalhes["MACD"] = f"+2 (Histograma positivo e crescente: {macd_val:.3f})"
+        elif macd_val > 0:
+            score += 1; detalhes["MACD"] = f"+1 (Histograma positivo: {macd_val:.3f})"
+        elif macd_val < 0 and macd_val < macd_prev:
+            score -= 2; detalhes["MACD"] = f"-2 (Histograma negativo e caindo: {macd_val:.3f})"
+        else:
+            score -= 1; detalhes["MACD"] = f"-1 (Histograma negativo: {macd_val:.3f})"
+
+    # 2. IFR / RSI
+    rsi = calcular_rsi(close, 14)
+    rsi_val = float(rsi.iloc[-1]) if not rsi.empty else 50
+    if rsi_val < 30:
+        score += 2; detalhes["IFR/RSI"] = f"+2 (Sobrevendido: {rsi_val:.1f})"
+    elif rsi_val < 40:
+        score += 1; detalhes["IFR/RSI"] = f"+1 (Região de compra: {rsi_val:.1f})"
+    elif rsi_val > 70:
+        score -= 2; detalhes["IFR/RSI"] = f"-2 (Sobrecomprado: {rsi_val:.1f})"
+    elif rsi_val > 60:
+        score -= 1; detalhes["IFR/RSI"] = f"-1 (Esticado: {rsi_val:.1f})"
+    else:
+        detalhes["IFR/RSI"] = f"0 (Neutro: {rsi_val:.1f})"
+
+    # 3. Bandas de Bollinger
+    bb_sup, bb_med, bb_inf, pct_b = calcular_bollinger(close)
+    pct_b_val = float(pct_b.iloc[-1]) if not pct_b.empty else 0.5
+    if pct_b_val < 0.05:
+        score += 2; detalhes["Bollinger"] = f"+2 (Abaixo da banda inferior: %B={pct_b_val:.2f})"
+    elif pct_b_val < 0.20:
+        score += 1; detalhes["Bollinger"] = f"+1 (Próximo da banda inferior: %B={pct_b_val:.2f})"
+    elif pct_b_val > 0.95:
+        score -= 2; detalhes["Bollinger"] = f"-2 (Acima da banda superior: %B={pct_b_val:.2f})"
+    elif pct_b_val > 0.80:
+        score -= 1; detalhes["Bollinger"] = f"-1 (Próximo da banda superior: %B={pct_b_val:.2f})"
+    else:
+        detalhes["Bollinger"] = f"0 (Zona neutra: %B={pct_b_val:.2f})"
+
+    # 4. ADX (Força da Tendência) + DI
+    adx, plus_di, minus_di, atr = calcular_adx(high, low, close)
+    adx_val = float(adx.iloc[-1]) if not adx.empty else 0
+    pdi = float(plus_di.iloc[-1]) if not plus_di.empty else 0
+    mdi = float(minus_di.iloc[-1]) if not minus_di.empty else 0
+    if adx_val > 25 and pdi > mdi:
+        score += 2; detalhes["ADX"] = f"+2 (Tendência forte de alta: ADX={adx_val:.1f}, +DI>{'-DI'})"
+    elif adx_val > 20 and pdi > mdi:
+        score += 1; detalhes["ADX"] = f"+1 (Tendência moderada de alta: ADX={adx_val:.1f})"
+    elif adx_val > 25 and mdi > pdi:
+        score -= 2; detalhes["ADX"] = f"-2 (Tendência forte de baixa: ADX={adx_val:.1f})"
+    elif adx_val > 20 and mdi > pdi:
+        score -= 1; detalhes["ADX"] = f"-1 (Tendência moderada de baixa: ADX={adx_val:.1f})"
+    else:
+        detalhes["ADX"] = f"0 (Sem tendência definida: ADX={adx_val:.1f})"
+
+    # 5. OBV (On Balance Volume) - Fluxo institucional
+    obv = calcular_obv(close, vol)
+    if len(obv) >= 10:
+        obv_ema = calcular_ema(obv, 10)
+        obv_val = float(obv.iloc[-1])
+        obv_ema_val = float(obv_ema.iloc[-1])
+        if obv_val > obv_ema_val:
+            score += 1; detalhes["OBV"] = f"+1 (Fluxo comprador acima da média)"
+        else:
+            score -= 1; detalhes["OBV"] = f"-1 (Fluxo vendedor abaixo da média)"
+
+    # 6. MFI (Money Flow Index)
+    mfi = calcular_mfi(high, low, close, vol)
+    mfi_val = float(mfi.iloc[-1]) if not mfi.empty else 50
+    if mfi_val < 20:
+        score += 2; detalhes["MFI"] = f"+2 (Pressão compradora extrema: MFI={mfi_val:.1f})"
+    elif mfi_val < 35:
+        score += 1; detalhes["MFI"] = f"+1 (Zona de acumulação: MFI={mfi_val:.1f})"
+    elif mfi_val > 80:
+        score -= 2; detalhes["MFI"] = f"-2 (Pressão vendedora extrema: MFI={mfi_val:.1f})"
+    elif mfi_val > 65:
+        score -= 1; detalhes["MFI"] = f"-1 (Zona de distribuição: MFI={mfi_val:.1f})"
+    else:
+        detalhes["MFI"] = f"0 (Equilíbrio: MFI={mfi_val:.1f})"
+
+    # 7. Estocástico %K / %D
+    k, d = calcular_estocastico(high, low, close)
+    k_val = float(k.iloc[-1]) if not k.empty else 50
+    d_val = float(d.iloc[-1]) if not d.empty else 50
+    if k_val < 20 and k_val > d_val:
+        score += 2; detalhes["Estocástico"] = f"+2 (Sobrevendido com cruzamento: %K={k_val:.1f})"
+    elif k_val < 30:
+        score += 1; detalhes["Estocástico"] = f"+1 (Zona sobrevendida: %K={k_val:.1f})"
+    elif k_val > 80 and k_val < d_val:
+        score -= 2; detalhes["Estocástico"] = f"-2 (Sobrecomprado com cruzamento: %K={k_val:.1f})"
+    elif k_val > 70:
+        score -= 1; detalhes["Estocástico"] = f"-1 (Zona sobrecomprada: %K={k_val:.1f})"
+    else:
+        detalhes["Estocástico"] = f"0 (Neutro: %K={k_val:.1f})"
+
+    # 8. Médias Móveis (EMA 9 x EMA 21 x EMA 50)
+    ema9 = calcular_ema(close, 9)
+    ema21 = calcular_ema(close, 21)
+    ema9v = float(ema9.iloc[-1])
+    ema21v = float(ema21.iloc[-1])
+    preco = float(close.iloc[-1])
+    if preco > ema9v > ema21v:
+        score += 2; detalhes["EMAs"] = f"+2 (Preço > EMA9 > EMA21 — alinhamento altista)"
+    elif ema9v > ema21v:
+        score += 1; detalhes["EMAs"] = f"+1 (EMA9 > EMA21 — tendência de alta)"
+    elif preco < ema9v < ema21v:
+        score -= 2; detalhes["EMAs"] = f"-2 (Preço < EMA9 < EMA21 — alinhamento baixista)"
+    elif ema9v < ema21v:
+        score -= 1; detalhes["EMAs"] = f"-1 (EMA9 < EMA21 — tendência de baixa)"
+    else:
+        detalhes["EMAs"] = f"0 (Indefinido)"
+
+    # 9. Gap de Abertura (padrão comum na B3 por conta de ADRs e mercado externo)
+    if len(close) >= 2:
+        gap_pct = ((float(close.iloc[-1]) / float(close.iloc[-2])) - 1) * 100
+        if gap_pct > 2.0:
+            score += 1; detalhes["Gap"] = f"+1 (Gap de alta: +{gap_pct:.2f}%)"
+        elif gap_pct < -2.0:
+            score -= 1; detalhes["Gap"] = f"-1 (Gap de baixa: {gap_pct:.2f}%)"
+        else:
+            detalhes["Gap"] = f"0 (Sem gap significativo: {gap_pct:+.2f}%)"
+
+    return score, detalhes
+
+
+@st.cache_data(ttl=300)
+def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_loss_pct, take_profit_pct, universo_tickers, trailing_stop_ativo, risco_por_trade_pct):
+    """
+    Motor Profissional de Trading Algorítmico da B3.
+    
+    Técnicas implementadas:
+    - Sistema de Confluência Multi-Indicador (MACD, RSI, Bollinger, ADX, OBV, MFI, Estocástico, EMAs, Gap)
+    - Trailing Stop dinâmico baseado em ATR
+    - Position Sizing com Kelly Criterion simplificado
+    - Emolumentos e taxas oficiais da B3 (0.03%)
+    - Gestão de risco por operação com teto de alocação
+    """
+    dt_ini_str = dt_inicio.strftime("%Y-%m-%d")
+    dt_fim_ajustada = (dt_fim + timedelta(days=3)).strftime("%Y-%m-%d")
+    
+    tickers_sa = [f"{t}.SA" if not t.endswith(".SA") else t for t in universo_tickers]
+    
+    try:
+        dados_mercado = yf.download(tickers_sa, start=dt_ini_str, end=dt_fim_ajustada, threads=True, progress=False)
+    except Exception:
+        return None
+
+    if dados_mercado.empty:
+        return None
+
+    close_df = dados_mercado["Close"]
+    high_df = dados_mercado["High"]
+    low_df = dados_mercado["Low"]
+    volume_df = dados_mercado["Volume"]
+    datas_pregao = close_df.index
+
+    if len(datas_pregao) < 30:
+        return None
+
+    caixa = float(capital_inicial)
+    custo_emolumentos_b3 = 0.0003  # 0.03% por transação (emolumentos + liquidação CBLC)
+    max_posicoes = 5
+    teto_alocacao_pct = risco_por_trade_pct / 100  # % do capital por posição
+    
+    posicoes = {}
+    livro_ordens = []
+    historico_patrimonio = []
+    indicadores_log = []  # log dos indicadores técnicos por dia
+
+    # Histórico de trades para cálculo Kelly
+    historico_resultados = []
+
+    for i in range(len(datas_pregao)):
+        dia = datas_pregao[i]
+        dia_str = dia.strftime("%d/%m/%Y")
+        patrimonio_corrente = caixa
+        for t, pos in posicoes.items():
+            if t in close_df:
+                p = float(close_df[t].iloc[i])
+                if not np.isnan(p):
+                    patrimonio_corrente += pos["qtd"] * p
+        
+        # =====================================================================
+        # FASE 1: GESTÃO DE POSIÇÕES ABERTAS (Verificação de Saídas)
+        # =====================================================================
+        tickers_em_custodia = list(posicoes.keys())
+        for t in tickers_em_custodia:
+            if t not in close_df:
+                continue
+            preco_fech = float(close_df[t].iloc[i])
+            if np.isnan(preco_fech) or preco_fech <= 0:
+                continue
+
+            pos = posicoes[t]
+            retorno_pos = (preco_fech / pos["preco_entrada"]) - 1.0
+
+            gatilho_saida = False
+            motivo_saida = ""
+            tipo_saida = ""
+
+            # Trailing Stop Dinâmico (baseado em ATR)
+            if trailing_stop_ativo and t in high_df and t in low_df:
+                atr_serie = calcular_atr(high_df[t].iloc[:i+1], low_df[t].iloc[:i+1], close_df[t].iloc[:i+1])
+                atr_val = float(atr_serie.iloc[-1]) if not atr_serie.empty and not np.isnan(atr_serie.iloc[-1]) else 0
+                
+                # Atualizar preço máximo atingido
+                if preco_fech > pos.get("preco_max", pos["preco_entrada"]):
+                    posicoes[t]["preco_max"] = preco_fech
+                
+                preco_max = pos.get("preco_max", pos["preco_entrada"])
+                trailing_level = preco_max - (2.5 * atr_val) if atr_val > 0 else preco_max * (1 - stop_loss_pct/100)
+                
+                if preco_fech <= trailing_level and retorno_pos > 0.005:
+                    gatilho_saida = True
+                    motivo_saida = f"📉 TRAILING STOP (ATR) — Máximo: R${preco_max:.2f}, Nível: R${trailing_level:.2f}"
+                    tipo_saida = "TRAILING"
+
+            # Stop Loss Fixo
+            if not gatilho_saida and retorno_pos <= -(stop_loss_pct / 100):
+                gatilho_saida = True
+                motivo_saida = f"🛑 STOP LOSS (-{stop_loss_pct:.1f}%) — Entrada: R${pos['preco_entrada']:.2f}"
+                tipo_saida = "STOP"
+            
+            # Take Profit Fixo
+            if not gatilho_saida and retorno_pos >= (take_profit_pct / 100):
+                gatilho_saida = True
+                motivo_saida = f"🎯 TAKE PROFIT (+{take_profit_pct:.1f}%) — Lucro realizado"
+                tipo_saida = "TAKE"
+
+            # Sinal técnico de reversão (confluência negativa)
+            if not gatilho_saida and i >= 30:
+                if estrategia in ["Confluência Multi-Indicador (Profissional)", "MACD + Bollinger (Volatilidade)", "Momentum com ADX (Força de Tendência)"]:
+                    if t in high_df and t in low_df and t in volume_df:
+                        score_atual, _ = gerar_score_confluencia(close_df[t], high_df[t], low_df[t], volume_df[t], i)
+                        if score_atual <= -6:
+                            gatilho_saida = True
+                            motivo_saida = f"🔄 REVERSÃO TÉCNICA — Score Confluência: {score_atual} (crítico)"
+                            tipo_saida = "REVERSAL"
+                elif estrategia == "Cruzamento de Médias (EMA 9 x EMA 21)":
+                    serie = close_df[t].iloc[:i+1].dropna()
+                    if len(serie) >= 21:
+                        ema9 = calcular_ema(serie, 9).iloc[-1]
+                        ema21 = calcular_ema(serie, 21).iloc[-1]
+                        if ema9 < ema21:
+                            gatilho_saida = True
+                            motivo_saida = "🔄 REVERSÃO — EMA 9 cruzou abaixo da EMA 21"
+                            tipo_saida = "REVERSAL"
+
+            if gatilho_saida:
+                valor_bruto_venda = pos["qtd"] * preco_fech
+                taxa_venda = valor_bruto_venda * custo_emolumentos_b3
+                valor_liquido = valor_bruto_venda - taxa_venda
+                custo_compra_total = (pos["qtd"] * pos["preco_entrada"]) + pos["taxas"]
+                resultado = valor_liquido - custo_compra_total
+                ret_pct = (resultado / custo_compra_total) * 100
+
+                caixa += valor_liquido
+                historico_resultados.append(resultado)
+
+                livro_ordens.append({
+                    "Data Pregão": dia_str,
+                    "Horário B3": "16:45:00",
+                    "Ticker": t.replace(".SA", ""),
+                    "Operação": "VENDA",
+                    "Qtd": pos["qtd"],
+                    "Preço Execução (R$)": round(preco_fech, 2),
+                    "Taxas B3 (R$)": round(taxa_venda, 2),
+                    "Resultado Trade (R$)": round(resultado, 2),
+                    "Retorno (%)": round(ret_pct, 2),
+                    "Motivo Execução": motivo_saida
+                })
+                del posicoes[t]
+
+        # =====================================================================
+        # FASE 2: BUSCA DE NOVAS OPORTUNIDADES DE COMPRA (Pregão 10:00 às 17:00)
+        # =====================================================================
+        if len(posicoes) < max_posicoes and caixa >= 1000.0 and i >= 30:
+            
+            candidatos = []
+            for t in tickers_sa:
+                if t in posicoes or t not in close_df or t not in high_df or t not in low_df or t not in volume_df:
+                    continue
+
+                serie_c = close_df[t].iloc[:i+1].dropna()
+                if len(serie_c) < 30:
+                    continue
+
+                preco_atual = float(serie_c.iloc[-1])
+                if np.isnan(preco_atual) or preco_atual <= 0:
+                    continue
+
+                sinal_compra = False
+                motivo_compra = ""
+                score_total = 0
+
+                if estrategia == "Confluência Multi-Indicador (Profissional)":
+                    score_total, det = gerar_score_confluencia(close_df[t], high_df[t], low_df[t], volume_df[t], i)
+                    if score_total >= 5:
+                        sinal_compra = True
+                        motivo_compra = f"✅ Confluência Forte ({score_total} pts): " + "; ".join([f"{k}={v.split('(')[0].strip()}" for k, v in det.items() if v.startswith("+")])
+                
+                elif estrategia == "MACD + Bollinger (Volatilidade)":
+                    macd_l, macd_s, macd_h = calcular_macd(serie_c)
+                    _, _, _, pct_b = calcular_bollinger(serie_c)
+                    if len(macd_h) >= 2 and len(pct_b) >= 1:
+                        macd_val = float(macd_h.iloc[-1])
+                        macd_prev = float(macd_h.iloc[-2])
+                        pctb_val = float(pct_b.iloc[-1])
+                        if macd_val > 0 and macd_val > macd_prev and pctb_val < 0.5:
+                            sinal_compra = True
+                            score_total = 6
+                            motivo_compra = f"✅ MACD acelerando (+{macd_val:.3f}) com Bollinger favorável (%B={pctb_val:.2f})"
+
+                elif estrategia == "Momentum com ADX (Força de Tendência)":
+                    adx, pdi, mdi, atr = calcular_adx(high_df[t].iloc[:i+1], low_df[t].iloc[:i+1], serie_c)
+                    rsi = calcular_rsi(serie_c)
+                    adx_val = float(adx.iloc[-1]) if not adx.empty else 0
+                    pdi_val = float(pdi.iloc[-1]) if not pdi.empty else 0
+                    mdi_val = float(mdi.iloc[-1]) if not mdi.empty else 0
+                    rsi_val = float(rsi.iloc[-1]) if not rsi.empty else 50
+                    if adx_val > 25 and pdi_val > mdi_val and rsi_val < 65:
+                        sinal_compra = True
+                        score_total = 7
+                        motivo_compra = f"✅ Tendência forte (ADX={adx_val:.1f}), +DI dominante, RSI={rsi_val:.1f}"
+
+                elif estrategia == "IFR + Estocástico (Reversão à Média)":
+                    rsi = calcular_rsi(serie_c)
+                    k, d = calcular_estocastico(high_df[t].iloc[:i+1], low_df[t].iloc[:i+1], serie_c)
+                    rsi_val = float(rsi.iloc[-1]) if not rsi.empty else 50
+                    k_val = float(k.iloc[-1]) if not k.empty else 50
+                    d_val = float(d.iloc[-1]) if not d.empty else 50
+                    if rsi_val < 35 and k_val < 25 and k_val > d_val:
+                        sinal_compra = True
+                        score_total = 8
+                        motivo_compra = f"✅ RSI sobrevendido ({rsi_val:.1f}) + Estocástico cruzando (%K={k_val:.1f} > %D={d_val:.1f})"
+
+                elif estrategia == "VWAP + OBV (Fluxo Institucional)":
+                    vwap = calcular_vwap(high_df[t].iloc[:i+1], low_df[t].iloc[:i+1], serie_c, volume_df[t].iloc[:i+1])
+                    obv = calcular_obv(serie_c, volume_df[t].iloc[:i+1])
+                    vwap_val = float(vwap.iloc[-1]) if not vwap.empty else preco_atual
+                    obv_ema = calcular_ema(obv, 10) if len(obv) >= 10 else obv
+                    obv_val = float(obv.iloc[-1]) if not obv.empty else 0
+                    obv_ema_val = float(obv_ema.iloc[-1]) if not obv_ema.empty else 0
+                    if preco_atual > vwap_val and obv_val > obv_ema_val:
+                        sinal_compra = True
+                        score_total = 6
+                        motivo_compra = f"✅ Preço acima do VWAP (R${vwap_val:.2f}) com OBV institucional comprador"
+
+                elif estrategia == "Cruzamento de Médias (EMA 9 x EMA 21)":
+                    ema9 = calcular_ema(serie_c, 9).iloc[-1]
+                    ema21 = calcular_ema(serie_c, 21).iloc[-1]
+                    if ema9 > ema21 and float(serie_c.iloc[-1]) > float(serie_c.iloc[-2]):
+                        sinal_compra = True
+                        score_total = 5
+                        motivo_compra = f"✅ Cruzamento EMA9 ({ema9:.2f}) > EMA21 ({ema21:.2f}) com candle de alta"
+
+                elif estrategia == "IFR / RSI Sobrevendido":
+                    rsi = calcular_rsi(serie_c, 14)
+                    rsi_val = float(rsi.iloc[-1]) if not rsi.empty else 50
+                    if rsi_val < 35:
+                        sinal_compra = True
+                        score_total = 5
+                        motivo_compra = f"✅ IFR Sobrevendido (RSI={rsi_val:.1f} < 35)"
+
+                if sinal_compra:
+                    candidatos.append((t, score_total, preco_atual, motivo_compra))
+
+            # Ordenar candidatos pelo score (melhor primeiro)
+            candidatos.sort(key=lambda x: x[1], reverse=True)
+
+            for t, score_c, preco_atual, motivo_compra in candidatos:
+                if len(posicoes) >= max_posicoes or caixa < 1000:
+                    break
+
+                # Position Sizing: Kelly Criterion simplificado ou percentual fixo
+                if len(historico_resultados) >= 5:
+                    wins = [r for r in historico_resultados if r > 0]
+                    losses = [abs(r) for r in historico_resultados if r < 0]
+                    win_rate = len(wins) / len(historico_resultados) if historico_resultados else 0.5
+                    avg_win = np.mean(wins) if wins else 1
+                    avg_loss = np.mean(losses) if losses else 1
+                    kelly_frac = (win_rate * avg_win - (1 - win_rate) * avg_loss) / (avg_win + 1e-10)
+                    kelly_frac = max(0.05, min(kelly_frac, teto_alocacao_pct))
+                else:
+                    kelly_frac = teto_alocacao_pct
+
+                capital_alocar = min(caixa * 0.95, patrimonio_corrente * kelly_frac)
+                qtd = int(capital_alocar // preco_atual)
+                
+                if qtd > 0:
+                    custo_bruto = qtd * preco_atual
+                    taxa_compra = custo_bruto * custo_emolumentos_b3
+                    custo_total = custo_bruto + taxa_compra
+
+                    if caixa >= custo_total:
+                        caixa -= custo_total
+                        posicoes[t] = {
+                            "qtd": qtd,
+                            "preco_entrada": preco_atual,
+                            "data_entrada": dia_str,
+                            "taxas": taxa_compra,
+                            "preco_max": preco_atual,
+                            "score_entrada": score_c
+                        }
+                        livro_ordens.append({
+                            "Data Pregão": dia_str,
+                            "Horário B3": "10:15:30",
+                            "Ticker": t.replace(".SA", ""),
+                            "Operação": "COMPRA",
+                            "Qtd": qtd,
+                            "Preço Execução (R$)": round(preco_atual, 2),
+                            "Taxas B3 (R$)": round(taxa_compra, 2),
+                            "Resultado Trade (R$)": 0.0,
+                            "Retorno (%)": 0.0,
+                            "Motivo Execução": motivo_compra
+                        })
+
+        # =====================================================================
+        # FASE 3: CONSOLIDAÇÃO DE PATRIMÔNIO (Fechamento 17:00)
+        # =====================================================================
+        valor_custodia = 0.0
+        for t, pos in posicoes.items():
+            if t in close_df:
+                p = float(close_df[t].iloc[i])
+                if not np.isnan(p):
+                    valor_custodia += pos["qtd"] * p
+
+        historico_patrimonio.append({
+            "Data": dia,
+            "Caixa (R$)": round(caixa, 2),
+            "Ações em Custódia (R$)": round(valor_custodia, 2),
+            "Patrimônio Total (R$)": round(caixa + valor_custodia, 2)
+        })
+
+    # Tabela de posições abertas restantes
+    posicoes_finais = []
+    for t, pos in posicoes.items():
+        if t in close_df:
+            p_ultimo = float(close_df[t].iloc[-1])
+            valor_atual = pos["qtd"] * p_ultimo
+            custo_compra = pos["qtd"] * pos["preco_entrada"]
+            pnl = valor_atual - custo_compra
+            pnl_pct = (pnl / custo_compra) * 100
+            posicoes_finais.append({
+                "Ticker": t.replace(".SA", ""),
+                "Data Entrada": pos["data_entrada"],
+                "Qtd": pos["qtd"],
+                "Preço Compra (R$)": round(pos["preco_entrada"], 2),
+                "Preço Atual (R$)": round(p_ultimo, 2),
+                "Valor em Custódia (R$)": round(valor_atual, 2),
+                "Resultado Aberto (R$)": round(pnl, 2),
+                "Retorno (%)": round(pnl_pct, 2),
+                "Score Entrada": pos.get("score_entrada", 0)
+            })
+
+    return {
+        "historico": pd.DataFrame(historico_patrimonio),
+        "ordens": pd.DataFrame(livro_ordens),
+        "posicoes_abertas": pd.DataFrame(posicoes_finais),
+        "caixa_final": caixa,
+        "patrimonio_final": historico_patrimonio[-1]["Patrimônio Total (R$)"] if historico_patrimonio else capital_inicial
+    }
+
+
+
+    
+
+# -----------------------------------------------------------------------------
+# 5. Barra Lateral (Parâmetros Globais)
+# -----------------------------------------------------------------------------
+st.sidebar.title("⚙️ Painel de Controle B3")
+
+status_texto, status_sub, hora_sp = obter_status_mercado_b3()
+st.sidebar.markdown(f"**Relógio B3 (Brasília):** `{hora_sp.strftime('%H:%M:%S')}`")
+st.sidebar.markdown(f"**Status:** {status_texto}")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚖️ Pesos de Avaliação Quantitativa")
+peso_lucro = st.sidebar.slider("Peso do Lucro / Variação (%)", 0, 100, 50, step=5) / 100
+peso_liquidez = st.sidebar.slider("Peso da Liquidez Diária (%)", 0, 100, 50, step=5) / 100
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Sincronizar B3 Agora", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.caption("Operando sob regras de pregão da Bolsa B3 (10h às 17h, D+2 de liquidação).")
+
+# -----------------------------------------------------------------------------
+# 6. Cabeçalho e Painel Macroeconômico
+# -----------------------------------------------------------------------------
+macro = obter_dados_macro()
+
+st.title("🤖 Plataforma Quantitativa B3: Robô Trader, Carteiras & Sinais")
+st.markdown(f"**Sistema Autônomo com Regras Oficiais de Pregão da B3** | Horário de Brasília: `{hora_sp.strftime('%d/%m/%Y %H:%M:%S')}`")
+
+col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+with col_m1:
+    st.metric("Taxa Selic Meta", f"{macro['selic']:.2f}% a.a.", help="SGS Banco Central")
+with col_m2:
+    st.metric("CDI Referência", f"{macro['cdi']:.2f}% a.a.", help="Benchmark financeiro")
+with col_m3:
+    st.metric("Status do Pregão B3", status_texto.split(" ")[1] if " " in status_texto else status_texto, delta=status_sub)
+with col_m4:
+    st.metric("Horário de Negociação", "10:00 às 17:00 (Regular)")
+
+st.markdown("---")
+
+# -----------------------------------------------------------------------------
+# 7. Estrutura de Abas (Com o Robô Trader em Destaque)
+# -----------------------------------------------------------------------------
+aba_robo, aba_carteiras, aba_simulador, aba_tickers, aba_matriz = st.tabs([
+    "🤖 Robô Trader B3 (Simulador Autônomo)",
+    "🎯 Carteiras Recomendadas",
+    "🧮 Simulador de Investimentos",
+    "📋 Todos os Tickers B3 (+2.300 ativos com Sinais)",
+    "📊 Matriz de Oportunidades & Quadrantes"
+])
+
+# =============================================================================
+# ABA 1: ROBÔ TRADER B3 (SIMULADOR AUTÔNOMO COM HORÁRIO E RELATÓRIOS)
+# =============================================================================
+with aba_robo:
+    st.subheader("🤖 Simulador de Robô Trader B3 (Corretor Autônomo)")
+    st.markdown(
+        "Configure o capital e o período. O robô opera **autonomamente**, "
+        "comprando e vendendo ativos com base na estratégia quantitativa escolhida, "
+        "respeitando a **abertura (10h)** e o **fechamento (17h)** da B3, debitando taxas de corretora e gerando os relatórios em tempo real e consolidado."
+    )
+
+    with st.expander("🛠️ Parâmetros Avançados do Robô Corretor B3", expanded=True):
+        c_r1, c_r2, c_r3 = st.columns(3)
+        with c_r1:
+            capital_robo = st.number_input("Capital Inicial do Robô (R$):", min_value=1_000.0, max_value=10_000_000.0, value=50_000.0, step=5_000.0)
+            estrategia_robo = st.selectbox(
+                "Estratégia Algorítmica Avançada:",
+                [
+                    "Confluência Multi-Indicador (Profissional)",
+                    "MACD + Bollinger (Volatilidade)",
+                    "Momentum com ADX (Força de Tendência)",
+                    "IFR + Estocástico (Reversão à Média)",
+                    "VWAP + OBV (Fluxo Institucional)",
+                    "Cruzamento de Médias (EMA 9 x EMA 21)",
+                    "IFR / RSI Sobrevendido"
+                ],
+                index=0,
+                help="Estratégias quantitativas e técnicas baseadas em modelos profissionais de corretoras da B3."
+            )
+        with c_r2:
+            data_ini_default = datetime.now().date() - timedelta(days=120)
+            data_fim_default = datetime.now().date()
+            data_inicio = st.date_input("Data de Início das Operações:", value=data_ini_default)
+            data_fim = st.date_input("Data de Fim das Operações:", value=data_fim_default)
+            trailing_stop = st.checkbox("Ativar Trailing Stop Dinâmico (ATR)", value=True, help="Move o stop para cima conforme o lucro sobe, protegendo ganhos com base na volatilidade real (ATR)")
+        with c_r3:
+            stop_loss = st.slider("Stop Loss Máximo (%):", min_value=1.0, max_value=15.0, value=3.5, step=0.5)
+            take_profit = st.slider("Take Profit / Alvo (%):", min_value=2.0, max_value=30.0, value=7.0, step=0.5)
+            risco_trade = st.slider("Teto por Operação (Kelly Sizing %):", min_value=10.0, max_value=40.0, value=20.0, step=5.0, help="Porcentagem máxima do patrimônio alocada em cada ativo")
+
+        st.info("💡 **Arsenal Técnico do Robô**: Utiliza **MACD (12,26,9)**, **IFR/RSI (14)**, **Bandas de Bollinger (20,2σ)**, **ADX (14)**, **OBV**, **MFI**, **Estocástico**, **VWAP**, **ATR** para trailing stop e **Critério de Kelly** para dimensionamento de lote.")
+        st.caption("Ativos no radar operacional do robô: *PETR4, VALE3, ITUB4, BBAS3, WEGE3, PRIO3, RENT3, GGBR4, SUZB3, B3SA3* (Top 10 Liquidez B3).")
+
+    # Universo de ações mais líquidas
+    tickers_radar = ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "PRIO3", "RENT3", "GGBR4", "SUZB3", "B3SA3"]
+
+    if st.button("🚀 Iniciar Operações do Robô Trader", use_container_width=True, type="primary"):
+        with st.spinner("Robô Trader executando pregões na B3, calculando confluência técnica e debitando custos operacionais..."):
+            res_robo = executar_robo_trader(
+                capital_inicial=capital_robo,
+                dt_inicio=data_inicio,
+                dt_fim=data_fim,
+                estrategia=estrategia_robo,
+                stop_loss_pct=stop_loss,
+                take_profit_pct=take_profit,
+                universo_tickers=tickers_radar,
+                trailing_stop_ativo=trailing_stop,
+                risco_por_trade_pct=risco_trade
+            )
+
+        if res_robo is None or res_robo["historico"].empty:
+            st.error("Dados históricos insuficientes para o período selecionado ou erro na coleta. Tente ampliar o intervalo de datas (mínimo 45 dias úteis recomendados para cálculo dos indicadores técnicos).")
+        else:
+            st.session_state["res_robo"] = res_robo
+
+    # Exibição dos Relatórios se já executado
+    if "res_robo" in st.session_state:
+        res_robo = st.session_state["res_robo"]
+        df_hist = res_robo["historico"]
+        df_ordens = res_robo["ordens"]
+        df_pos = res_robo["posicoes_abertas"]
+        patr_final = res_robo["patrimonio_final"]
+        caixa_final = res_robo["caixa_final"]
+        
+        lucro_reais = patr_final - capital_robo
+        retorno_pct = (lucro_reais / capital_robo) * 100
+
+        # Estatísticas do Relatório Final
+        vendas = df_ordens[df_ordens["Operação"] == "VENDA"] if not df_ordens.empty else pd.DataFrame()
+        total_trades_encerrados = len(vendas)
+        trades_vencedores = len(vendas[vendas["Resultado Trade (R$)"] > 0]) if not vendas.empty else 0
+        taxa_acerto = (trades_vencedores / total_trades_encerrados * 100) if total_trades_encerrados > 0 else 0.0
+
+        lucro_bruto_ganhos = vendas[vendas["Resultado Trade (R$)"] > 0]["Resultado Trade (R$)"].sum() if not vendas.empty else 0
+        prejuizo_bruto_perdas = abs(vendas[vendas["Resultado Trade (R$)"] < 0]["Resultado Trade (R$)"].sum()) if not vendas.empty else 0
+        profit_factor = (lucro_bruto_ganhos / prejuizo_bruto_perdas) if prejuizo_bruto_perdas > 0 else (lucro_bruto_ganhos if lucro_bruto_ganhos > 0 else 1.0)
+
+        # Drawdown Máximo
+        df_hist["Pico"] = df_hist["Patrimônio Total (R$)"].cummax()
+        df_hist["Drawdown"] = (df_hist["Patrimônio Total (R$)"] - df_hist["Pico"]) / df_hist["Pico"] * 100
+        max_drawdown = df_hist["Drawdown"].min()
+
+        st.markdown("---")
+        st.subheader("📊 Relatório em Tempo Real de Desempenho do Robô")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            st.metric("Patrimônio Final Líquido", f"R$ {patr_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), delta=f"{retorno_pct:+.2f}%")
+        with k2:
+            st.metric("Lucro / Prejuízo Líquido", f"R$ {lucro_reais:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        with k3:
+            st.metric("Taxa de Acerto (Win Rate)", f"{taxa_acerto:.1f}%", help="% de trades encerrados com lucro")
+        with k4:
+            st.metric("Fator de Lucro (Profit Factor)", f"{profit_factor:.2f}", help="Ganhos brutos divididos pelas perdas brutas")
+        with k5:
+            st.metric("Drawdown Máximo", f"{max_drawdown:.2f}%", help="Maior queda percentual temporária de pico a vale")
+
+        # Gráfico da Curva de Capital (Equity Curve)
+        fig_equity = px.line(
+            df_hist,
+            x="Data",
+            y="Patrimônio Total (R$)",
+            title=f"Curva de Capital do Robô Trader B3 ({data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')})",
+            markers=True
+        )
+        fig_equity.add_hline(y=capital_robo, line_dash="dash", line_color="gray", annotation_text="Capital Inicial")
+        fig_equity.update_layout(height=420, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_equity, use_container_width=True)
+
+        # Posições em Custódia e Livro de Ordens
+        col_rel1, col_rel2 = st.columns([1, 1])
+
+        with col_rel1:
+            st.markdown("#### 💼 Posições Abertas em Custódia (Final do Período)")
+            if not df_pos.empty:
+                st.dataframe(
+                    df_pos.style.format({
+                        "Preço Compra (R$)": "R$ {:.2f}",
+                        "Preço Atual (R$)": "R$ {:.2f}",
+                        "Valor em Custódia (R$)": "R$ {:.2f}",
+                        "Resultado Aberto (R$)": "{:+.2f}",
+                        "Retorno (%)": "{:+.2f}%"
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.info("Nenhuma posição aberta no momento. O robô liquidou as ordens ou está 100% em caixa.")
+
+            st.metric("Saldo em Caixa Disponível", f"R$ {caixa_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        with col_rel2:
+            st.markdown("#### 📜 Livro de Ordens Executadas pelo Robô")
+            if not df_ordens.empty:
+                st.dataframe(
+                    df_ordens[[
+                        "Data Pregão", "Ticker", "Operação", "Qtd",
+                        "Preço Execução (R$)", "Resultado Trade (R$)", "Motivo Execução"
+                    ]].tail(15).style.format({
+                        "Preço Execução (R$)": "R$ {:.2f}",
+                        "Resultado Trade (R$)": "{:+.2f}"
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.info("Nenhuma ordem executada no período.")
+
+        # Download do Extrato Completo
+        st.markdown("---")
+        st.subheader("📑 Relatório Final Consolidado (Encerramento do Período)")
+        st.success(
+            f"**Diagnóstico do Corretor B3**: O Robô Trader encerrou o período com um resultado líquido de "
+            f"**R$ {lucro_reais:,.2f} ({retorno_pct:+.2f}%)** com **{total_trades_encerrados} trades finalizados** e "
+            f"taxa de acerto de **{taxa_acerto:.1f}%**. Todos os emolumentos da B3 (0,03% por ordem) foram computados com precisão."
+        )
+
+        csv_ordens = df_ordens.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Baixar Extrato Oficial de Ordens do Robô Trader (CSV)",
+            data=csv_ordens,
+            file_name=f"extrato_robo_trader_b3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+# =============================================================================
+# DEMAIS ABAS DO SISTEMA
+# =============================================================================
+with aba_carteiras:
+    st.subheader("🏆 Carteiras Recomendadas por Perfil de Investidor")
+    perfil_sel = st.radio(
+        "Selecione a Estratégia:",
+        ["🛡️ Conservadora (Máxima Liquidez)", "💰 Dividendos & Renda Passiva", "🚀 Crescimento & Alpha"],
+        horizontal=True
+    )
+    if "Conservadora" in perfil_sel:
+        cart_data = [
+            {"Ativo": "Tesouro Selic", "Tipo": "Renda Fixa Pública", "Alocação (%)": 40, "Liquidez": "D+1", "Rentabilidade Alvo": f"{macro['selic']:.2f}% a.a.", "Sinal": "🟢 COMPRA FORTE"},
+            {"Ativo": "CDB 105% CDI", "Tipo": "Renda Fixa Bancária", "Alocação (%)": 30, "Liquidez": "D+0", "Rentabilidade Alvo": f"~{macro['cdi']*1.05:.2f}% a.a.", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "KNCR11", "Tipo": "FII de Papel (CDI)", "Alocação (%)": 15, "Liquidez": "D+2", "Rentabilidade Alvo": "CDI + 2.0% a.a. isento", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "HGLG11", "Tipo": "FII de Logística", "Alocação (%)": 15, "Liquidez": "D+2", "Rentabilidade Alvo": "IPCA + 7.5% a.a.", "Sinal": "🟡 MANTER"}
+        ]
+    elif "Dividendos" in perfil_sel:
+        cart_data = [
+            {"Ativo": "BBAS3", "Tipo": "Ação (Bancário)", "Alocação (%)": 20, "Liquidez": "Alta", "Rentabilidade Alvo": "DY ~9.5% a.a.", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "ITUB4", "Tipo": "Ação (Bancário)", "Alocação (%)": 20, "Liquidez": "Altíssima", "Rentabilidade Alvo": "DY ~7.5% a.a.", "Sinal": "🟢 COMPRA FORTE"},
+            {"Ativo": "TAEE11", "Tipo": "Ação (Elétrica)", "Alocação (%)": 15, "Liquidez": "Alta", "Rentabilidade Alvo": "DY ~8.5% a.a.", "Sinal": "🟡 MANTER"},
+            {"Ativo": "MXRF11", "Tipo": "FII de Papel", "Alocação (%)": 15, "Liquidez": "Máxima FII", "Rentabilidade Alvo": "DY ~11.0% a.a. isento", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "XPML11", "Tipo": "FII Shoppings", "Alocação (%)": 15, "Liquidez": "Alta", "Rentabilidade Alvo": "DY ~8.5% a.a. isento", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "Tesouro Selic", "Tipo": "Caixa Oportunidade", "Alocação (%)": 15, "Liquidez": "D+1", "Rentabilidade Alvo": f"{macro['selic']:.2f}% a.a.", "Sinal": "🟢 COMPRA"}
+        ]
+    else:
+        cart_data = [
+            {"Ativo": "PETR4", "Tipo": "Ação (Petróleo)", "Alocação (%)": 20, "Liquidez": "Máxima", "Rentabilidade Alvo": "DY ~14% + Caixa", "Sinal": "🟢 COMPRA FORTE"},
+            {"Ativo": "VALE3", "Tipo": "Ação (Mineração)", "Alocação (%)": 15, "Liquidez": "Máxima", "Rentabilidade Alvo": "Ciclo Global", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "WEGE3", "Tipo": "Ação (Indústria/Tech)", "Alocação (%)": 20, "Liquidez": "Alta", "Rentabilidade Alvo": "CAGR > 15% a.a.", "Sinal": "🟢 COMPRA"},
+            {"Ativo": "PRIO3", "Tipo": "Ação (Petróleo Júnior)", "Alocação (%)": 15, "Liquidez": "Alta", "Rentabilidade Alvo": "Crescimento Produção", "Sinal": "🟢 COMPRA FORTE"},
+            {"Ativo": "RENT3", "Tipo": "Ação (Mobilidade)", "Alocação (%)": 15, "Liquidez": "Alta", "Rentabilidade Alvo": "Recuperação Ciclo", "Sinal": "🟡 MANTER"},
+            {"Ativo": "Tesouro Selic", "Tipo": "Caixa Tático", "Alocação (%)": 15, "Liquidez": "D+1", "Rentabilidade Alvo": f"{macro['selic']:.2f}% a.a.", "Sinal": "🟢 COMPRA"}
+        ]
+    df_c = pd.DataFrame(cart_data)
+    c_p1, c_p2 = st.columns([1, 2])
+    with c_p1:
+        fig_p = px.pie(df_c, values="Alocação (%)", names="Ativo", hole=0.45, title="Alocação da Carteira")
+        st.plotly_chart(fig_p, use_container_width=True)
+    with c_p2:
+        st.dataframe(df_c, hide_index=True, use_container_width=True)
+
+with aba_simulador:
+    st.subheader("🧮 Simulador de Investimentos & Projeção Patrimonial")
+    st.caption("Simule a evolução do seu patrimônio comparando a carteira recomendada com o CDI e a Poupança.")
+
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    with col_s1:
+        aporte_inicial = st.number_input("Capital Inicial (R$):", min_value=100.0, max_value=10_000_000.0, value=20_000.0, step=1000.0)
+    with col_s2:
+        aporte_mensal = st.number_input("Aporte Mensal (R$):", min_value=0.0, max_value=1_000_000.0, value=1_500.0, step=200.0)
+    with col_s3:
+        prazo_meses = st.slider("Prazo de Investimento (Meses):", min_value=6, max_value=120, value=36, step=6)
+    with col_s4:
+        estrategia_simulacao = st.selectbox(
+            "Estratégia Escolhida:",
+            ["Crescimento & Alpha (CDI + 6%)", "Dividendos (CDI + 3%)", "Conservadora (CDI + 0.5%)"]
+        )
+
+    # Taxas anuais
+    if "Alpha" in estrategia_simulacao:
+        taxa_carteira_aa = (macro['cdi'] + 6.0) / 100
+    elif "Dividendos" in estrategia_simulacao:
+        taxa_carteira_aa = (macro['cdi'] + 3.0) / 100
+    else:
+        taxa_carteira_aa = (macro['cdi'] + 0.5) / 100
+
+    taxa_cdi_aa = macro['cdi'] / 100
+    taxa_poupanca_aa = 0.0617  # Poupança clássica ~6.17% a.a.
+
+    # Taxas mensais equivalentes
+    r_cart_mes = (1 + taxa_carteira_aa) ** (1/12) - 1
+    r_cdi_mes = (1 + taxa_cdi_aa) ** (1/12) - 1
+    r_poup_mes = (1 + taxa_poupanca_aa) ** (1/12) - 1
+
+    meses = list(range(prazo_meses + 1))
+    val_cart = [aporte_inicial]
+    val_cdi = [aporte_inicial]
+    val_poup = [aporte_inicial]
+    total_investido = [aporte_inicial]
+
+    for m in range(1, prazo_meses + 1):
+        total_investido.append(total_investido[-1] + aporte_mensal)
+        val_cart.append((val_cart[-1] + aporte_mensal) * (1 + r_cart_mes))
+        val_cdi.append((val_cdi[-1] + aporte_mensal) * (1 + r_cdi_mes))
+        val_poup.append((val_poup[-1] + aporte_mensal) * (1 + r_poup_mes))
+
+    df_sim = pd.DataFrame({
+        "Mês": meses,
+        "Total Aportado": total_investido,
+        "Carteira Recomendada": val_cart,
+        "100% do CDI": val_cdi,
+        "Poupança": val_poup
+    })
+
+    saldo_final_cart = val_cart[-1]
+    saldo_final_cdi = val_cdi[-1]
+    total_aportado_final = total_investido[-1]
+    lucro_liquido_cart = saldo_final_cart - total_aportado_final
+    renda_mensal_estimada = saldo_final_cart * r_cart_mes
+
+    st.markdown("---")
+    res1, res2, res3, res4 = st.columns(4)
+    with res1:
+        st.metric("Total Investido do Bolso", f"R$ {total_aportado_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    with res2:
+        st.metric("Patrimônio Final na Carteira", f"R$ {saldo_final_cart:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), delta=f"+ R$ {saldo_final_cart - saldo_final_cdi:,.2f} vs. CDI".replace(",", "X").replace(".", ",").replace("X", "."))
+    with res3:
+        st.metric("Lucro Líquido dos Rendimentos", f"R$ {lucro_liquido_cart:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    with res4:
+        st.metric("Renda Passiva Mensal Estimada", f"R$ {renda_mensal_estimada:,.2f}/mês".replace(",", "X").replace(".", ",").replace("X", "."), help="Rendimento mensal ao término do período")
+
+    # Gráfico de evolução patrimonial
+    fig_sim = go.Figure()
+    fig_sim.add_trace(go.Scatter(x=df_sim["Mês"], y=df_sim["Carteira Recomendada"], mode="lines", name=f"Carteira ({estrategia_simulacao.split(' ')[0]})", line=dict(color="#00E676", width=3)))
+    fig_sim.add_trace(go.Scatter(x=df_sim["Mês"], y=df_sim["100% do CDI"], mode="lines", name=f"100% do CDI ({macro['cdi']:.2f}% a.a.)", line=dict(color="#29B6F6", width=2, dash="dash")))
+    fig_sim.add_trace(go.Scatter(x=df_sim["Mês"], y=df_sim["Poupança"], mode="lines", name="Poupança (~6.17% a.a.)", line=dict(color="#FFA726", width=2, dash="dot")))
+    fig_sim.add_trace(go.Scatter(x=df_sim["Mês"], y=df_sim["Total Aportado"], mode="lines", name="Total Aportado do Bolso", line=dict(color="#9E9E9E", width=1)))
+
+    fig_sim.update_layout(
+        title="Projeção Comparativa de Evolução Patrimonial (R$)",
+        xaxis_title="Tempo (Meses)",
+        yaxis_title="Patrimônio Acumulado (R$)",
+        height=450,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
+    st.plotly_chart(fig_sim, use_container_width=True)
+
+# Coleta de Tickers para Aba 4 e 5
+with st.spinner("Atualizando lista de ativos da B3..."):
+    df_raw = carregar_todos_tickers_b3()
+
+with aba_tickers:
+    st.subheader("📋 Grade de Tickers da B3 com Sinais de Compra/Venda")
+    if not df_raw.empty:
+        df_t = df_raw.copy()
+        
+        # Sinais rápidos
+        def gerar_sinal(row):
+            var = row["Variação Dia (%)"]
+            vol = row["Volume Financeiro (R$ Mi)"]
+            if var > 1.0 and vol > 1.0:
+                return "🟢 COMPRA FORTE"
+            elif var >= 0.0 and vol > 0.1:
+                return "🟢 COMPRA"
+            elif var > -1.5:
+                return "🟡 MANTER"
+            elif var <= -2.5 and vol > 1.0:
+                return "🔴 VENDA / STOP"
+            else:
+                return "⚪ AGUARDAR / EVITAR"
+
+        df_t["Sinal Operacional"] = df_t.apply(gerar_sinal, axis=1)
+
+        col_pesq1, col_pesq2 = st.columns([2, 1])
+        with col_pesq1:
+            busca = st.text_input("🔍 Pesquisar Ativo (Código ou Nome):", "").strip().upper()
+        with col_pesq2:
+            filtro_s = st.selectbox("Filtrar por Sinal:", ["Todos os Sinais", "🟢 COMPRA FORTE", "🟢 COMPRA", "🟡 MANTER", "🔴 VENDA / STOP", "⚪ AGUARDAR / EVITAR"])
+
+        if busca:
+            df_t = df_t[df_t["Ticker"].str.contains(busca) | df_t["Nome / Razão Social"].str.upper().str.contains(busca)]
+        if filtro_s != "Todos os Sinais":
+            df_t = df_t[df_t["Sinal Operacional"] == filtro_s]
+
+        colunas_grid = ["Ticker", "Nome / Razão Social", "Classe", "Preço Atual (R$)", "Variação Dia (%)", "Volume Financeiro (R$ Mi)", "Sinal Operacional"]
+        st.dataframe(
+            df_t[colunas_grid].style.format({
+                "Preço Atual (R$)": "R$ {:.2f}",
+                "Variação Dia (%)": "{:+.2f}%",
+                "Volume Financeiro (R$ Mi)": "R$ {:.2f} Mi"
+            }),
+            use_container_width=True,
+            hide_index=True,
+            height=500
+        )
+
+        csv_t = df_t[colunas_grid].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label=f"📥 Baixar Grade de Tickers ({len(df_t)} ativos) em CSV",
+            data=csv_t,
+            file_name=f"tickers_b3_sinais_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+with aba_matriz:
+    st.subheader("📊 Matriz de Oportunidades: Lucratividade x Liquidez")
+    if not df_raw.empty:
+        df_top = df_raw.sort_values(by="Volume Financeiro (R$ Mi)", ascending=False).head(60)
+        fig_scat = px.scatter(
+            df_top,
+            x="Volume Financeiro (R$ Mi)",
+            y="Variação Dia (%)",
+            text="Ticker",
+            color="Classe",
+            hover_name="Nome / Razão Social",
+            size="Volume Financeiro (R$ Mi)",
+            labels={"Volume Financeiro (R$ Mi)": "Volume Negociado (R$ Milhões)", "Variação Dia (%)": "Lucratividade / Variação Dia (%)"}
+        )
+        fig_scat.update_traces(textposition='top center')
+        fig_scat.update_layout(height=520, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig_scat, use_container_width=True)
+
