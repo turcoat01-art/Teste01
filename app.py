@@ -4,6 +4,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+import os
+import json
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
@@ -420,13 +422,15 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
     - Emolumentos e taxas oficiais da B3 (0.03%)
     - Gestão de risco por operação com teto de alocação
     """
-    dt_ini_str = dt_inicio.strftime("%Y-%m-%d")
-    dt_fim_ajustada = (dt_fim + timedelta(days=3)).strftime("%Y-%m-%d")
+    # Baixamos 90 dias antes de dt_inicio APENAS para warm-up dos indicadores (MACD, RSI, ADX, etc.)
+    # MAS nenhuma ordem é executada antes da data real estipulada!
+    dt_warmup_str = (dt_inicio - timedelta(days=90)).strftime("%Y-%m-%d")
+    dt_fim_ajustada = (dt_fim + timedelta(days=2)).strftime("%Y-%m-%d")
     
     tickers_sa = [f"{t}.SA" if not t.endswith(".SA") else t for t in universo_tickers]
     
     try:
-        dados_mercado = yf.download(tickers_sa, start=dt_ini_str, end=dt_fim_ajustada, threads=True, progress=False)
+        dados_mercado = yf.download(tickers_sa, start=dt_warmup_str, end=dt_fim_ajustada, threads=True, progress=False)
     except Exception:
         return None
 
@@ -439,7 +443,7 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
     volume_df = dados_mercado["Volume"]
     datas_pregao = close_df.index
 
-    if len(datas_pregao) < 30:
+    if len(datas_pregao) < 5:
         return None
 
     caixa = float(capital_inicial)
@@ -457,6 +461,16 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
 
     for i in range(len(datas_pregao)):
         dia = datas_pregao[i]
+        dia_date = dia.date() if hasattr(dia, "date") else pd.to_datetime(dia).date()
+        
+        # REGRA ABSOLUTA DE OPERAÇÃO:
+        # O robô NÃO opera antes da data de início estipulada pelo usuário!
+        if dia_date < dt_inicio:
+            continue
+            
+        if dia_date > dt_fim:
+            break
+
         dia_str = dia.strftime("%d/%m/%Y")
         patrimonio_corrente = caixa
         for t, pos in posicoes.items():
@@ -670,9 +684,12 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
                     kelly_frac = teto_alocacao_pct
 
                 capital_alocar = min(caixa * 0.95, patrimonio_corrente * kelly_frac)
-                qtd = int(capital_alocar // preco_atual)
+                # Regra B3: Lote Padrão de 100 em 100 ações (não fracionado)
+                lote_padrao = 100
+                num_lotes = int(capital_alocar // (preco_atual * lote_padrao))
+                qtd = num_lotes * lote_padrao
                 
-                if qtd > 0:
+                if qtd >= 100:
                     custo_bruto = qtd * preco_atual
                     taxa_compra = custo_bruto * custo_emolumentos_b3
                     custo_total = custo_bruto + taxa_compra
@@ -738,6 +755,14 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
                 "Score Entrada": pos.get("score_entrada", 0)
             })
 
+    if not historico_patrimonio:
+        historico_patrimonio.append({
+            "Data": pd.to_datetime(dt_inicio),
+            "Caixa (R$)": round(caixa, 2),
+            "Ações em Custódia (R$)": 0.0,
+            "Patrimônio Total (R$)": round(caixa, 2)
+        })
+
     return {
         "historico": pd.DataFrame(historico_patrimonio),
         "ordens": pd.DataFrame(livro_ordens),
@@ -746,12 +771,117 @@ def executar_robo_trader(capital_inicial, dt_inicio, dt_fim, estrategia, stop_lo
         "patrimonio_final": historico_patrimonio[-1]["Patrimônio Total (R$)"] if historico_patrimonio else capital_inicial
     }
 
+# -----------------------------------------------------------------------------
+# 5. Gerenciamento de Estado Persistente do Robô Trader (Ciclos Programados)
+# -----------------------------------------------------------------------------
+ARQUIVO_ESTADO_ROBO = "robo_state.json"
 
+def carregar_estado_robo():
+    if os.path.exists(ARQUIVO_ESTADO_ROBO):
+        try:
+            with open(ARQUIVO_ESTADO_ROBO, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
 
-    
+def salvar_estado_robo(estado):
+    try:
+        with open(ARQUIVO_ESTADO_ROBO, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        pass
+    salvar_no_banco_historico(estado)
+
+def resetar_ciclo_robo():
+    if os.path.exists(ARQUIVO_ESTADO_ROBO):
+        try:
+            os.remove(ARQUIVO_ESTADO_ROBO)
+        except Exception:
+            pass
 
 # -----------------------------------------------------------------------------
-# 5. Barra Lateral (Parâmetros Globais)
+# Banco de Histórico Permanente de Ciclos (Auditoria e Análise Futura)
+# -----------------------------------------------------------------------------
+ARQUIVO_BANCO_HISTORICO = "historico_banco_robo.json"
+
+def carregar_banco_historico():
+    if os.path.exists(ARQUIVO_BANCO_HISTORICO):
+        try:
+            with open(ARQUIVO_BANCO_HISTORICO, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def salvar_no_banco_historico(estado):
+    if not estado:
+        return
+    banco = carregar_banco_historico()
+    id_ciclo = estado.get("id_ciclo")
+    if not id_ciclo:
+        id_ciclo = f"CICLO_{estado.get('data_inicio', '').replace('-', '')}_{datetime.now().strftime('%H%M%S')}"
+        estado["id_ciclo"] = id_ciclo
+    
+    cap_ini = float(estado.get("capital_inicial", 0))
+    patr_fim = float(estado.get("patrimonio_final", cap_ini))
+    lucro = patr_fim - cap_ini
+    ret_pct = (lucro / cap_ini * 100) if cap_ini > 0 else 0.0
+    
+    ordens = estado.get("ordens", [])
+    vendas = [o for o in ordens if o.get("Operação") == "VENDA"]
+    total_trades = len(vendas)
+    venc = len([o for o in vendas if o.get("Resultado Trade (R$)", 0) > 0])
+    win_rate = (venc / total_trades * 100) if total_trades > 0 else 0.0
+    
+    ganhos = sum([o.get("Resultado Trade (R$)", 0) for o in vendas if o.get("Resultado Trade (R$)", 0) > 0])
+    perdas = abs(sum([o.get("Resultado Trade (R$)", 0) for o in vendas if o.get("Resultado Trade (R$)", 0) < 0]))
+    pf = (ganhos / perdas) if perdas > 0 else (ganhos if ganhos > 0 else 1.0)
+    
+    registro = {
+        "id_ciclo": id_ciclo,
+        "data_registro": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "data_inicio": estado.get("data_inicio"),
+        "data_fim": estado.get("data_fim"),
+        "estrategia": estado.get("estrategia"),
+        "status": estado.get("status"),
+        "capital_inicial": cap_ini,
+        "caixa_final": float(estado.get("caixa_final", 0)),
+        "patrimonio_final": patr_fim,
+        "lucro_reais": round(lucro, 2),
+        "retorno_pct": round(ret_pct, 2),
+        "total_trades": total_trades,
+        "win_rate_pct": round(win_rate, 1),
+        "profit_factor": round(pf, 2),
+        "stop_loss_pct": estado.get("stop_loss_pct"),
+        "take_profit_pct": estado.get("take_profit_pct"),
+        "trailing_stop": estado.get("trailing_stop"),
+        "risco_trade_pct": estado.get("risco_trade_pct"),
+        "universo": estado.get("universo"),
+        "total_ordens": len(ordens),
+        "ordens": ordens,
+        "posicoes_abertas": estado.get("posicoes_abertas", []),
+        "historico": estado.get("historico", [])
+    }
+    
+    idx = -1
+    for i, item in enumerate(banco):
+        if item.get("id_ciclo") == id_ciclo:
+            idx = i
+            break
+    if idx >= 0:
+        banco[idx] = registro
+    else:
+        banco.append(registro)
+        
+    try:
+        with open(ARQUIVO_BANCO_HISTORICO, "w", encoding="utf-8") as f:
+            json.dump(banco, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        pass
+
+# -----------------------------------------------------------------------------
+# 6. Barra Lateral (Parâmetros Globais)
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Painel de Controle B3")
 
@@ -806,174 +936,356 @@ aba_robo, aba_carteiras, aba_simulador, aba_tickers, aba_matriz = st.tabs([
 # ABA 1: ROBÔ TRADER B3 (SIMULADOR AUTÔNOMO COM HORÁRIO E RELATÓRIOS)
 # =============================================================================
 with aba_robo:
-    st.subheader("🤖 Simulador de Robô Trader B3 (Corretor Autônomo)")
+    st.subheader("🤖 Robô Trader B3: Corretor Autônomo com Ciclo Programado")
     st.markdown(
-        "Configure o capital e o período. O robô opera **autonomamente**, "
-        "comprando e vendendo ativos com base na estratégia quantitativa escolhida, "
-        "respeitando a **abertura (10h)** e o **fechamento (17h)** da B3, debitando taxas de corretora e gerando os relatórios em tempo real e consolidado."
+        "Configure o robô, defina a **Data de Início (ex: hoje)** e a **Data de Desligamento (ex: dia 15)**. "
+        "Ao ligar, o robô opera de forma autônoma na B3, persiste o estado em disco e disponibiliza o **Relatório Final Consolidado** ao término do ciclo."
     )
 
-    with st.expander("🛠️ Parâmetros Avançados do Robô Corretor B3", expanded=True):
-        c_r1, c_r2, c_r3 = st.columns(3)
-        with c_r1:
-            capital_robo = st.number_input("Capital Inicial do Robô (R$):", min_value=1_000.0, max_value=10_000_000.0, value=50_000.0, step=5_000.0)
-            estrategia_robo = st.selectbox(
-                "Estratégia Algorítmica Avançada:",
-                [
-                    "Confluência Multi-Indicador (Profissional)",
-                    "MACD + Bollinger (Volatilidade)",
-                    "Momentum com ADX (Força de Tendência)",
-                    "IFR + Estocástico (Reversão à Média)",
-                    "VWAP + OBV (Fluxo Institucional)",
-                    "Cruzamento de Médias (EMA 9 x EMA 21)",
-                    "IFR / RSI Sobrevendido"
-                ],
-                index=0,
-                help="Estratégias quantitativas e técnicas baseadas em modelos profissionais de corretoras da B3."
-            )
-        with c_r2:
-            data_ini_default = datetime.now().date() - timedelta(days=120)
-            data_fim_default = datetime.now().date()
-            data_inicio = st.date_input("Data de Início das Operações:", value=data_ini_default)
-            data_fim = st.date_input("Data de Fim das Operações:", value=data_fim_default)
-            trailing_stop = st.checkbox("Ativar Trailing Stop Dinâmico (ATR)", value=True, help="Move o stop para cima conforme o lucro sobe, protegendo ganhos com base na volatilidade real (ATR)")
-        with c_r3:
-            stop_loss = st.slider("Stop Loss Máximo (%):", min_value=1.0, max_value=15.0, value=3.5, step=0.5)
-            take_profit = st.slider("Take Profit / Alvo (%):", min_value=2.0, max_value=30.0, value=7.0, step=0.5)
-            risco_trade = st.slider("Teto por Operação (Kelly Sizing %):", min_value=10.0, max_value=40.0, value=20.0, step=5.0, help="Porcentagem máxima do patrimônio alocada em cada ativo")
+    estado_robo = carregar_estado_robo()
 
-        st.info("💡 **Arsenal Técnico do Robô**: Utiliza **MACD (12,26,9)**, **IFR/RSI (14)**, **Bandas de Bollinger (20,2σ)**, **ADX (14)**, **OBV**, **MFI**, **Estocástico**, **VWAP**, **ATR** para trailing stop e **Critério de Kelly** para dimensionamento de lote.")
-        st.caption("Ativos no radar operacional do robô: *PETR4, VALE3, ITUB4, BBAS3, WEGE3, PRIO3, RENT3, GGBR4, SUZB3, B3SA3* (Top 10 Liquidez B3).")
+    # Se o robô estiver ativo, verificar se já atingiu a data de encerramento
+    if estado_robo is not None and estado_robo.get("status") == "ATIVO":
+        dt_fim_obj = datetime.strptime(estado_robo["data_fim"], "%Y-%m-%d").date()
+        hoje_sp = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
+        if hoje_sp >= dt_fim_obj:
+            estado_robo["status"] = "ENCERRADO"
+            estado_robo["data_encerramento"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            salvar_estado_robo(estado_robo)
 
-    # Universo de ações mais líquidas
-    tickers_radar = ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "PRIO3", "RENT3", "GGBR4", "SUZB3", "B3SA3"]
+    # =========================================================================
+    # ESTADO 1: INATIVO (Painel de Configuração para Ligar o Robô)
+    # =========================================================================
+    if estado_robo is None:
+        st.info("⚪ **Status: Robô Desligado**. Configure os parâmetros abaixo e clique em **Ligar Robô Trader** para iniciar o ciclo.")
 
-    if st.button("🚀 Iniciar Operações do Robô Trader", use_container_width=True, type="primary"):
-        with st.spinner("Robô Trader executando pregões na B3, calculando confluência técnica e debitando custos operacionais..."):
-            res_robo = executar_robo_trader(
-                capital_inicial=capital_robo,
-                dt_inicio=data_inicio,
-                dt_fim=data_fim,
-                estrategia=estrategia_robo,
-                stop_loss_pct=stop_loss,
-                take_profit_pct=take_profit,
-                universo_tickers=tickers_radar,
-                trailing_stop_ativo=trailing_stop,
-                risco_por_trade_pct=risco_trade
-            )
+        with st.expander("⚙️ Parâmetros do Ciclo Operacional", expanded=True):
+            c_r1, c_r2, c_r3 = st.columns(3)
+            with c_r1:
+                capital_robo = st.number_input("Capital Inicial a Alocar (R$):", min_value=1_000.0, max_value=10_000_000.0, value=50_000.0, step=5_000.0)
+                estrategia_robo = st.selectbox(
+                    "Estratégia Algorítmica Avançada:",
+                    [
+                        "Confluência Multi-Indicador (Profissional)",
+                        "MACD + Bollinger (Volatilidade)",
+                        "Momentum com ADX (Força de Tendência)",
+                        "IFR + Estocástico (Reversão à Média)",
+                        "VWAP + OBV (Fluxo Institucional)",
+                        "Cruzamento de Médias (EMA 9 x EMA 21)",
+                        "IFR / RSI Sobrevendido"
+                    ],
+                    index=0
+                )
+                opcoes_universo = {
+                    "Top 10 Blue Chips de Alta Liquidez": ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "PRIO3", "RENT3", "GGBR4", "SUZB3", "B3SA3"],
+                    "Top 20 Ações Mais Negociadas da B3": ["PETR4", "VALE3", "ITUB4", "BBDC4", "BBAS3", "WEGE3", "ABEV3", "RENT3", "PRIO3", "SUZB3", "GGBR4", "RADL3", "LREN3", "EQTL3", "SBSP3", "TOTS3", "UGPA3", "EGIE3", "CYRE3", "B3SA3"],
+                    "Ações de Dividendos e Renda": ["BBAS3", "ITUB4", "BBDC4", "TAEE11", "CPFE3", "CMIG4", "VBBR3", "EGIE3", "SANB11"]
+                }
+                escolha_universo = st.selectbox("Universo de Ações Monitoradas:", list(opcoes_universo.keys()), index=0)
+                tickers_selecionados = opcoes_universo[escolha_universo]
 
-        if res_robo is None or res_robo["historico"].empty:
-            st.error("Dados históricos insuficientes para o período selecionado ou erro na coleta. Tente ampliar o intervalo de datas (mínimo 45 dias úteis recomendados para cálculo dos indicadores técnicos).")
-        else:
-            st.session_state["res_robo"] = res_robo
+            with c_r2:
+                hoje_padrao = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
+                fim_padrao = hoje_padrao + timedelta(days=3)  # default: 3 dias no futuro (ex: dia 15 se hoje for 12)
+                data_inicio = st.date_input("Data de Início das Operações:", value=hoje_padrao)
+                data_fim = st.date_input("Data de Desligamento / Encerramento:", value=fim_padrao)
+                trailing_stop = st.checkbox("Ativar Trailing Stop Dinâmico (ATR)", value=True)
 
-    # Exibição dos Relatórios se já executado
-    if "res_robo" in st.session_state:
-        res_robo = st.session_state["res_robo"]
-        df_hist = res_robo["historico"]
-        df_ordens = res_robo["ordens"]
-        df_pos = res_robo["posicoes_abertas"]
-        patr_final = res_robo["patrimonio_final"]
-        caixa_final = res_robo["caixa_final"]
-        
-        lucro_reais = patr_final - capital_robo
-        retorno_pct = (lucro_reais / capital_robo) * 100
+            with c_r3:
+                stop_loss = st.slider("Stop Loss Máximo (%):", min_value=1.0, max_value=15.0, value=3.5, step=0.5)
+                take_profit = st.slider("Take Profit / Alvo (%):", min_value=2.0, max_value=30.0, value=7.0, step=0.5)
+                risco_trade = st.slider("Teto por Operação (Kelly %):", min_value=10.0, max_value=40.0, value=20.0, step=5.0)
 
-        # Estatísticas do Relatório Final
+            st.caption(f"Radar operacional ({len(tickers_selecionados)} ativos): {', '.join(tickers_selecionados)}")
+
+        if st.button("🟢 LIGAR ROBÔ TRADER (Iniciar Ciclo Autônomo)", use_container_width=True, type="primary"):
+            with st.spinner("Ligando o Robô Trader, registrando ciclo no sistema e sincronizando primeiros pregões..."):
+                res_robo = executar_robo_trader(
+                    capital_inicial=capital_robo,
+                    dt_inicio=data_inicio,
+                    dt_fim=data_fim,
+                    estrategia=estrategia_robo,
+                    stop_loss_pct=stop_loss,
+                    take_profit_pct=take_profit,
+                    universo_tickers=tickers_selecionados,
+                    trailing_stop_ativo=trailing_stop,
+                    risco_por_trade_pct=risco_trade
+                )
+
+                if res_robo and not res_robo["historico"].empty:
+                    novo_estado = {
+                        "status": "ATIVO",
+                        "capital_inicial": float(capital_robo),
+                        "data_inicio": data_inicio.strftime("%Y-%m-%d"),
+                        "data_fim": data_fim.strftime("%Y-%m-%d"),
+                        "estrategia": estrategia_robo,
+                        "stop_loss_pct": float(stop_loss),
+                        "take_profit_pct": float(take_profit),
+                        "trailing_stop": bool(trailing_stop),
+                        "risco_trade_pct": float(risco_trade),
+                        "universo": tickers_selecionados,
+                        "data_ligado": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                        "caixa_final": float(res_robo["caixa_final"]),
+                        "patrimonio_final": float(res_robo["patrimonio_final"]),
+                        "historico": res_robo["historico"].to_dict(orient="records"),
+                        "ordens": res_robo["ordens"].to_dict(orient="records"),
+                        "posicoes_abertas": res_robo["posicoes_abertas"].to_dict(orient="records")
+                    }
+                    # Se hoje já for a data de fim ou posterior, já encerra automaticamente
+                    hoje_atual = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
+                    if hoje_atual >= data_fim:
+                        novo_estado["status"] = "ENCERRADO"
+                        novo_estado["data_encerramento"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+                    salvar_estado_robo(novo_estado)
+                    st.success("✅ Robô Trader LIGADO com sucesso! Estado persistido em disco.")
+                    st.rerun()
+                else:
+                    st.error("Erro ao sincronizar com a B3. Verifique a conexão com a internet e tente novamente.")
+
+    # =========================================================================
+    # ESTADO 2: ATIVO (Robô em Operação Contínua)
+    # =========================================================================
+    elif estado_robo.get("status") == "ATIVO":
+        st.success(
+            f"🟢 **STATUS: ROBÔ TRADER EM OPERAÇÃO ATIVA NA B3** | "
+            f"Ciclo Programado: de **{estado_robo['data_inicio']}** até **{estado_robo['data_fim']}** | "
+            f"Estratégia: **{estado_robo['estrategia']}**"
+        )
+
+        col_act1, col_act2, col_act3 = st.columns([1, 1, 1])
+        with col_act1:
+            if st.button("🔄 Sincronizar Agora com a B3", use_container_width=True):
+                with st.spinner("Buscando cotações atualizadas e recalculando posições..."):
+                    dt_ini = datetime.strptime(estado_robo["data_inicio"], "%Y-%m-%d").date()
+                    dt_fim = datetime.strptime(estado_robo["data_fim"], "%Y-%m-%d").date()
+                    res_sync = executar_robo_trader(
+                        capital_inicial=estado_robo["capital_inicial"],
+                        dt_inicio=dt_ini,
+                        dt_fim=dt_fim,
+                        estrategia=estado_robo["estrategia"],
+                        stop_loss_pct=estado_robo["stop_loss_pct"],
+                        take_profit_pct=estado_robo["take_profit_pct"],
+                        universo_tickers=estado_robo["universo"],
+                        trailing_stop_ativo=estado_robo["trailing_stop"],
+                        risco_por_trade_pct=estado_robo["risco_trade_pct"]
+                    )
+                    if res_sync:
+                        estado_robo["caixa_final"] = float(res_sync["caixa_final"])
+                        estado_robo["patrimonio_final"] = float(res_sync["patrimonio_final"])
+                        estado_robo["historico"] = res_sync["historico"].to_dict(orient="records")
+                        estado_robo["ordens"] = res_sync["ordens"].to_dict(orient="records")
+                        estado_robo["posicoes_abertas"] = res_sync["posicoes_abertas"].to_dict(orient="records")
+                        salvar_estado_robo(estado_robo)
+                        st.rerun()
+
+        with col_act2:
+            if st.button("⏹️ Encerrar Ciclo Antecipadamente", use_container_width=True):
+                estado_robo["status"] = "ENCERRADO"
+                estado_robo["data_encerramento"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S (Antecipado)")
+                salvar_estado_robo(estado_robo)
+                st.rerun()
+
+        with col_act3:
+            if st.button("⚠️ Resetar / Cancelar Robô", use_container_width=True):
+                resetar_ciclo_robo()
+                st.rerun()
+
+        st.caption(f"💡 O robô está ligado e persistido no arquivo local `robo_state.json`. Na data de **{estado_robo['data_fim']}**, o ciclo será concluído automaticamente e o Relatório Final estará consolidado.")
+
+        # Painel em Tempo Real
+        df_hist = pd.DataFrame(estado_robo.get("historico", []))
+        df_ordens = pd.DataFrame(estado_robo.get("ordens", []))
+        df_pos = pd.DataFrame(estado_robo.get("posicoes_abertas", []))
+        cap_ini = estado_robo["capital_inicial"]
+        patr_atual = estado_robo.get("patrimonio_final", cap_ini)
+        lucro_atual = patr_atual - cap_ini
+        ret_atual = (lucro_atual / cap_ini) * 100
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Patrimônio Atual", f"R$ {patr_atual:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), delta=f"{ret_atual:+.2f}%")
+        with k2:
+            st.metric("Lucro / Prejuízo em Aberto", f"R$ {lucro_atual:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        with k3:
+            st.metric("Caixa Disponível", f"R$ {estado_robo.get('caixa_final', 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        with k4:
+            st.metric("Total de Ordens Executadas", f"{len(df_ordens)} ordens B3")
+
+        if not df_hist.empty:
+            fig_eq = px.line(df_hist, x="Data", y="Patrimônio Total (R$)", title="Evolução do Patrimônio em Tempo Real (R$)", markers=True)
+            fig_eq.add_hline(y=cap_ini, line_dash="dash", line_color="gray", annotation_text="Capital Inicial")
+            fig_eq.update_layout(height=380, margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+        c_p1, c_p2 = st.columns([1, 1])
+        with c_p1:
+            st.markdown("#### 💼 Posições Abertas em Carteira")
+            if not df_pos.empty:
+                st.dataframe(df_pos.style.format({"Preço Compra (R$)": "R$ {:.2f}", "Preço Atual (R$)": "R$ {:.2f}", "Valor em Custódia (R$)": "R$ {:.2f}", "Resultado Aberto (R$)": "{:+.2f}", "Retorno (%)": "{:+.2f}%"}), hide_index=True, use_container_width=True)
+            else:
+                st.info("Nenhuma posição aberta no momento. O robô está 100% em caixa aguardando novo sinal de compra.")
+
+        with c_p2:
+            st.markdown("#### 📜 Livro de Ordens em Tempo Real")
+            if not df_ordens.empty:
+                st.dataframe(df_ordens[["Data Pregão", "Ticker", "Operação", "Qtd", "Preço Execução (R$)", "Resultado Trade (R$)", "Motivo Execução"]].tail(10).style.format({"Preço Execução (R$)": "R$ {:.2f}", "Resultado Trade (R$)": "{:+.2f}"}), hide_index=True, use_container_width=True)
+            else:
+                st.info("Aguardando abertura de novas posições no horário do pregão.")
+
+    # =========================================================================
+    # ESTADO 3: ENCERRADO (Relatório Final Consolidado do Período)
+    # =========================================================================
+    elif estado_robo.get("status") == "ENCERRADO":
+        st.warning(
+            f"🏁 **STATUS: CICLO OPERACIONAL CONCLUÍDO** | "
+            f"Período operado: de **{estado_robo['data_inicio']}** até **{estado_robo['data_fim']}** | "
+            f"Data de Encerramento: **{estado_robo.get('data_encerramento', 'Encerramento Automático')}**"
+        )
+
+        df_hist = pd.DataFrame(estado_robo.get("historico", []))
+        df_ordens = pd.DataFrame(estado_robo.get("ordens", []))
+        cap_ini = estado_robo["capital_inicial"]
+        patr_fim = estado_robo.get("patrimonio_final", cap_ini)
+        lucro_fim = patr_fim - cap_ini
+        ret_fim = (lucro_fim / cap_ini) * 100
+
         vendas = df_ordens[df_ordens["Operação"] == "VENDA"] if not df_ordens.empty else pd.DataFrame()
-        total_trades_encerrados = len(vendas)
-        trades_vencedores = len(vendas[vendas["Resultado Trade (R$)"] > 0]) if not vendas.empty else 0
-        taxa_acerto = (trades_vencedores / total_trades_encerrados * 100) if total_trades_encerrados > 0 else 0.0
+        total_trades = len(vendas)
+        trades_venc = len(vendas[vendas["Resultado Trade (R$)"] > 0]) if not vendas.empty else 0
+        win_rate = (trades_venc / total_trades * 100) if total_trades > 0 else 0.0
 
-        lucro_bruto_ganhos = vendas[vendas["Resultado Trade (R$)"] > 0]["Resultado Trade (R$)"].sum() if not vendas.empty else 0
-        prejuizo_bruto_perdas = abs(vendas[vendas["Resultado Trade (R$)"] < 0]["Resultado Trade (R$)"].sum()) if not vendas.empty else 0
-        profit_factor = (lucro_bruto_ganhos / prejuizo_bruto_perdas) if prejuizo_bruto_perdas > 0 else (lucro_bruto_ganhos if lucro_bruto_ganhos > 0 else 1.0)
+        lucro_ganhos = vendas[vendas["Resultado Trade (R$)"] > 0]["Resultado Trade (R$)"].sum() if not vendas.empty else 0
+        prej_perdas = abs(vendas[vendas["Resultado Trade (R$)"] < 0]["Resultado Trade (R$)"].sum()) if not vendas.empty else 0
+        profit_factor = (lucro_ganhos / prej_perdas) if prej_perdas > 0 else (lucro_ganhos if lucro_ganhos > 0 else 1.0)
 
-        # Drawdown Máximo
-        df_hist["Pico"] = df_hist["Patrimônio Total (R$)"].cummax()
-        df_hist["Drawdown"] = (df_hist["Patrimônio Total (R$)"] - df_hist["Pico"]) / df_hist["Pico"] * 100
-        max_drawdown = df_hist["Drawdown"].min()
+        if not df_hist.empty:
+            df_hist["Pico"] = df_hist["Patrimônio Total (R$)"].cummax()
+            df_hist["Drawdown"] = (df_hist["Patrimônio Total (R$)"] - df_hist["Pico"]) / df_hist["Pico"] * 100
+            max_dd = df_hist["Drawdown"].min()
+        else:
+            max_dd = 0.0
 
-        st.markdown("---")
-        st.subheader("📊 Relatório em Tempo Real de Desempenho do Robô")
+        st.subheader("📑 Relatório Final Consolidado do Corretor B3")
+        
+        st.success(
+            f"**Parecer do Corretor Especialista B3**: O ciclo foi finalizado com resultado líquido de "
+            f"**R$ {lucro_fim:,.2f} ({ret_fim:+.2f}%)**, totalizando **{total_trades} trades fechados**, "
+            f"taxa de acerto de **{win_rate:.1f}%** e Fator de Lucro de **{profit_factor:.2f}**. Todos os emolumentos da B3 (0,03% por ordem) foram computados."
+        )
 
         k1, k2, k3, k4, k5 = st.columns(5)
         with k1:
-            st.metric("Patrimônio Final Líquido", f"R$ {patr_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), delta=f"{retorno_pct:+.2f}%")
+            st.metric("Patrimônio Final", f"R$ {patr_fim:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), delta=f"{ret_fim:+.2f}%")
         with k2:
-            st.metric("Lucro / Prejuízo Líquido", f"R$ {lucro_reais:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.metric("Lucro Líquido Real", f"R$ {lucro_fim:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         with k3:
-            st.metric("Taxa de Acerto (Win Rate)", f"{taxa_acerto:.1f}%", help="% de trades encerrados com lucro")
+            st.metric("Taxa de Acerto (Win Rate)", f"{win_rate:.1f}%")
         with k4:
-            st.metric("Fator de Lucro (Profit Factor)", f"{profit_factor:.2f}", help="Ganhos brutos divididos pelas perdas brutas")
+            st.metric("Fator de Lucro (Profit Factor)", f"{profit_factor:.2f}")
         with k5:
-            st.metric("Drawdown Máximo", f"{max_drawdown:.2f}%", help="Maior queda percentual temporária de pico a vale")
+            st.metric("Drawdown Máximo", f"{max_dd:.2f}%")
 
-        # Gráfico da Curva de Capital (Equity Curve)
-        fig_equity = px.line(
-            df_hist,
-            x="Data",
-            y="Patrimônio Total (R$)",
-            title=f"Curva de Capital do Robô Trader B3 ({data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')})",
-            markers=True
-        )
-        fig_equity.add_hline(y=capital_robo, line_dash="dash", line_color="gray", annotation_text="Capital Inicial")
-        fig_equity.update_layout(height=420, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig_equity, use_container_width=True)
+        if not df_hist.empty:
+            fig_eq = px.line(df_hist, x="Data", y="Patrimônio Total (R$)", title=f"Curva de Capital Final do Ciclo ({estado_robo['data_inicio']} a {estado_robo['data_fim']})", markers=True)
+            fig_eq.add_hline(y=cap_ini, line_dash="dash", line_color="gray", annotation_text="Capital Inicial")
+            fig_eq.update_layout(height=420, margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_eq, use_container_width=True)
 
-        # Posições em Custódia e Livro de Ordens
-        col_rel1, col_rel2 = st.columns([1, 1])
-
-        with col_rel1:
-            st.markdown("#### 💼 Posições Abertas em Custódia (Final do Período)")
-            if not df_pos.empty:
-                st.dataframe(
-                    df_pos.style.format({
-                        "Preço Compra (R$)": "R$ {:.2f}",
-                        "Preço Atual (R$)": "R$ {:.2f}",
-                        "Valor em Custódia (R$)": "R$ {:.2f}",
-                        "Resultado Aberto (R$)": "{:+.2f}",
-                        "Retorno (%)": "{:+.2f}%"
-                    }),
-                    hide_index=True,
+        st.markdown("#### 📜 Extrato Oficial de Todas as Ordens Executadas no Ciclo")
+        if not df_ordens.empty:
+            st.dataframe(df_ordens.style.format({"Preço Execução (R$)": "R$ {:.2f}", "Taxas B3 (R$)": "R$ {:.2f}", "Resultado Trade (R$)": "{:+.2f}", "Retorno (%)": "{:+.2f}%"}), hide_index=True, use_container_width=True)
+            csv_relatorio = df_ordens.to_csv(index=False).encode('utf-8')
+            c_d1, c_d2 = st.columns([1, 1])
+            with c_d1:
+                st.download_button(
+                    label="📥 Baixar Relatório Final Oficial em CSV",
+                    data=csv_relatorio,
+                    file_name=f"relatorio_final_robo_b3_{estado_robo['data_inicio']}_a_{estado_robo['data_fim']}.csv",
+                    mime="text/csv",
                     use_container_width=True
                 )
-            else:
-                st.info("Nenhuma posição aberta no momento. O robô liquidou as ordens ou está 100% em caixa.")
+            with c_d2:
+                if st.button("🚀 Iniciar Novo Ciclo Operacional", use_container_width=True, type="primary"):
+                    resetar_ciclo_robo()
+                    st.rerun()
 
-            st.metric("Saldo em Caixa Disponível", f"R$ {caixa_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-        with col_rel2:
-            st.markdown("#### 📜 Livro de Ordens Executadas pelo Robô")
-            if not df_ordens.empty:
-                st.dataframe(
-                    df_ordens[[
-                        "Data Pregão", "Ticker", "Operação", "Qtd",
-                        "Preço Execução (R$)", "Resultado Trade (R$)", "Motivo Execução"
-                    ]].tail(15).style.format({
-                        "Preço Execução (R$)": "R$ {:.2f}",
-                        "Resultado Trade (R$)": "{:+.2f}"
-                    }),
-                    hide_index=True,
-                    use_container_width=True
-                )
-            else:
-                st.info("Nenhuma ordem executada no período.")
-
-        # Download do Extrato Completo
+    # =========================================================================
+    # BANCO HISTÓRICO PERMANENTE DE CICLOS DO ROBÔ (Para Comparações Futuras)
+    # =========================================================================
+    banco_historico = carregar_banco_historico()
+    if banco_historico:
         st.markdown("---")
-        st.subheader("📑 Relatório Final Consolidado (Encerramento do Período)")
-        st.success(
-            f"**Diagnóstico do Corretor B3**: O Robô Trader encerrou o período com um resultado líquido de "
-            f"**R$ {lucro_reais:,.2f} ({retorno_pct:+.2f}%)** com **{total_trades_encerrados} trades finalizados** e "
-            f"taxa de acerto de **{taxa_acerto:.1f}%**. Todos os emolumentos da B3 (0,03% por ordem) foram computados com precisão."
+        st.subheader("📚 Banco Histórico de Ciclos & Comparativo de Estratégias")
+        st.markdown(
+            "Todos os ciclos operacionais executados pelo robô ficam registrados abaixo para **auditoria, análise de performance e comparações futuras** entre estratégias."
         )
 
-        csv_ordens = df_ordens.to_csv(index=False).encode('utf-8')
+        dados_tabela_banco = []
+        for reg in banco_historico:
+            dados_tabela_banco.append({
+                "ID Ciclo": reg.get("id_ciclo"),
+                "Data Registro": reg.get("data_registro"),
+                "Estratégia": reg.get("estrategia"),
+                "Período Operado": f"{reg.get('data_inicio')} a {reg.get('data_fim')}",
+                "Status": reg.get("status"),
+                "Capital Inicial (R$)": reg.get("capital_inicial", 0.0),
+                "Patrimônio Final (R$)": reg.get("patrimonio_final", 0.0),
+                "Lucro Líquido (R$)": reg.get("lucro_reais", 0.0),
+                "Retorno (%)": reg.get("retorno_pct", 0.0),
+                "Win Rate (%)": reg.get("win_rate_pct", 0.0),
+                "Profit Factor": reg.get("profit_factor", 0.0),
+                "Total Ordens": reg.get("total_ordens", 0)
+            })
+
+        df_banco = pd.DataFrame(dados_tabela_banco)
+        st.dataframe(
+            df_banco.style.format({
+                "Capital Inicial (R$)": "R$ {:,.2f}",
+                "Patrimônio Final (R$)": "R$ {:,.2f}",
+                "Lucro Líquido (R$)": "R$ {:+,.2f}",
+                "Retorno (%)": "{:+.2f}%",
+                "Win Rate (%)": "{:.1f}%",
+                "Profit Factor": "{:.2f}"
+            }),
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # Gráfico comparativo se houver pelo menos 1 ciclo
+        if len(df_banco) > 1:
+            fig_comp = px.bar(
+                df_banco,
+                x="Estratégia",
+                y="Retorno (%)",
+                color="Retorno (%)",
+                color_continuous_scale=["red", "yellow", "green"],
+                title="Comparativo de Retorno (%) entre Estratégias e Ciclos Testados",
+                text="Retorno (%)"
+            )
+            fig_comp.update_traces(texttemplate='%{text:.2f}%', textposition='outside')
+            fig_comp.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_comp, use_container_width=True)
+
+        # Inspecionar detalhes de um ciclo passado
+        with st.expander("🔍 Inspecionar Livro de Ordens de um Ciclo Específico"):
+            opcoes_ciclos = [c.get("id_ciclo") for c in banco_historico]
+            ciclo_escolhido = st.selectbox("Selecione o Ciclo para Visualizar:", opcoes_ciclos)
+            reg_escolhido = next((c for c in banco_historico if c.get("id_ciclo") == ciclo_escolhido), None)
+            if reg_escolhido:
+                st.write(f"**Estratégia**: {reg_escolhido.get('estrategia')} | **Período**: {reg_escolhido.get('data_inicio')} a {reg_escolhido.get('data_fim')} | **Retorno**: {reg_escolhido.get('retorno_pct'):+.2f}%")
+                ordens_ciclo = pd.DataFrame(reg_escolhido.get("ordens", []))
+                if not ordens_ciclo.empty:
+                    st.dataframe(ordens_ciclo, hide_index=True, use_container_width=True)
+                else:
+                    st.info("Nenhuma ordem executada neste ciclo.")
+
+        # Download do Banco Histórico Completo
+        csv_banco = df_banco.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Baixar Extrato Oficial de Ordens do Robô Trader (CSV)",
-            data=csv_ordens,
-            file_name=f"extrato_robo_trader_b3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            label="📥 Baixar Banco Histórico Consolidado de Todos os Ciclos (CSV)",
+            data=csv_banco,
+            file_name=f"historico_geral_ciclos_robo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv"
         )
 

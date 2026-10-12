@@ -1,0 +1,45 @@
+[
+  {
+    "id_ciclo": "CICLO_20261012_200250",
+    "data_registro": "12/10/2026 20:02:50",
+    "data_inicio": "2026-10-12",
+    "data_fim": "2026-10-15",
+    "estrategia": "VWAP + OBV (Fluxo Institucional)",
+    "status": "ATIVO",
+    "capital_inicial": 10000.0,
+    "caixa_final": 10000.0,
+    "patrimonio_final": 10000.0,
+    "lucro_reais": 0.0,
+    "retorno_pct": 0.0,
+    "total_trades": 0,
+    "win_rate_pct": 0.0,
+    "profit_factor": 1.0,
+    "stop_loss_pct": 3.5,
+    "take_profit_pct": 7.0,
+    "trailing_stop": true,
+    "risco_trade_pct": 20.0,
+    "universo": [
+      "PETR4",
+      "VALE3",
+      "ITUB4",
+      "BBAS3",
+      "WEGE3",
+      "PRIO3",
+      "RENT3",
+      "GGBR4",
+      "SUZB3",
+      "B3SA3"
+    ],
+    "total_ordens": 0,
+    "ordens": [],
+    "posicoes_abertas": [],
+    "historico": [
+      {
+        "Data": "2026-10-12 00:00:00",
+        "Caixa (R$)": 10000.0,
+        "Ações em Custódia (R$)": 0.0,
+        "Patrimônio Total (R$)": 10000.0
+      }
+    ]
+  }
+]
